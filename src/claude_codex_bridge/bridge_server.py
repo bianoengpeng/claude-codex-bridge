@@ -33,6 +33,10 @@ Codex excels at:
 • Generating comprehensive test strategies
 • Code review and optimization suggestions
 
+Callers should assess each task's difficulty and set the
+`task_complexity` parameter ("low", "medium", or "high") accordingly to
+guide Codex's reasoning effort.
+
 By default, operates in read-only mode for safety. Enable write mode with --allow-write
 when you're ready to apply Codex's recommendations.""",
 )
@@ -53,6 +57,7 @@ async def invoke_codex_cli(
     working_directory: str,
     execution_mode: str,
     sandbox_mode: str,
+    task_complexity: Literal["low", "medium", "high"] = "medium",
     allow_write: bool = True,
     timeout: int = 300,  # 5 minute timeout
 ) -> Tuple[str, str]:
@@ -64,6 +69,7 @@ async def invoke_codex_cli(
         working_directory: Codex working directory
         execution_mode: Codex CLI approval strategy mode
         sandbox_mode: Codex CLI sandbox strategy mode
+        task_complexity: Desired model reasoning effort level (default: "medium")
         allow_write: Whether to allow file write operations
         timeout: Command timeout in seconds
 
@@ -96,6 +102,9 @@ async def invoke_codex_cli(
     else:
         # Specify sandbox mode only (approval mode not available for exec subcommand)
         command.extend(["-s", sandbox_mode])
+
+    # Configure model reasoning effort based on task complexity
+    command.extend(["-c", f'model_reasoning_effort="{task_complexity}"'])
 
     # Add delimiter to ensure any leading dashes in prompt
     # are treated as positional text, not CLI flags
@@ -194,6 +203,7 @@ async def codex_delegate(
         "read-only", "workspace-write", "danger-full-access"
     ] = "workspace-write",
     output_format: Literal["diff", "full_file", "explanation"] = "diff",
+    task_complexity: Literal["low", "medium", "high"] = "medium",
 ) -> str:
     """
     Leverage Codex's advanced analytical capabilities for code comprehension and
@@ -206,6 +216,9 @@ async def codex_delegate(
     • Generating comprehensive test strategies
     • Reviewing code for quality, security, and performance issues
 
+    Evaluate each task's difficulty and set `task_complexity` to "low",
+    "medium", or "high" so Codex can allocate appropriate reasoning effort.
+
     By default, operates in read-only mode to focus on analysis and planning.
     Enable write mode with --allow-write flag when ready to apply changes.
 
@@ -215,6 +228,7 @@ async def codex_delegate(
         execution_mode: Approval strategy (default: on-failure)
         sandbox_mode: File access mode (forced to read-only unless --allow-write)
         output_format: How to format the analysis results
+        task_complexity: Guidance for Codex's reasoning effort (default: "medium")
 
     Returns:
         Detailed analysis, recommendations, or implementation plan
@@ -299,6 +313,7 @@ async def codex_delegate(
             working_directory,
             execution_mode,
             effective_sandbox_mode,
+            task_complexity,
             allow_write,
         )
 
@@ -495,7 +510,8 @@ codex_delegate(
     working_directory="/path/to/your/project",
     execution_mode="on-failure",
     sandbox_mode="read-only",      # Enforced automatically
-    output_format="explanation"
+    output_format="explanation",
+    task_complexity="medium"
 )
 ```
 
@@ -506,7 +522,8 @@ codex_delegate(
     working_directory="/path/to/your/project",
     execution_mode="on-failure",
     sandbox_mode="workspace-write",  # Now allowed
-    output_format="diff"
+    output_format="diff",
+    task_complexity="high"
 )
 ```
 
@@ -536,6 +553,10 @@ codex_delegate(
 - `explanation`: Natural language analysis and recommendations (best for planning)
 - `diff`: Changes in patch format (useful for implementation)
 - `full_file`: Complete modified file content
+
+**task_complexity** (optional, default: "medium")
+- Reflects task difficulty and guides Codex's reasoning effort
+- Choose "low", "medium", or "high" after assessing the task
 
 ## Advanced Features
 
@@ -581,6 +602,7 @@ working_directory: "/Users/username/my-web-app"
 execution_mode: "on-failure"
 sandbox_mode: "read-only"  # Automatically enforced
 output_format: "explanation"
+task_complexity: "medium"
 ```
 
 **Step 2: Planning (Planning Mode)**
@@ -590,6 +612,7 @@ working_directory: "/Users/username/my-web-app"
 execution_mode: "on-failure"
 sandbox_mode: "read-only"  # Automatically enforced
 output_format: "explanation"
+task_complexity: "medium"
 ```
 
 **Step 3: Implementation (Execution Mode - requires --allow-write)**
@@ -599,6 +622,7 @@ working_directory: "/Users/username/my-web-app"
 execution_mode: "on-failure"
 sandbox_mode: "workspace-write"  # Now allowed
 output_format: "diff"
+task_complexity: "high"
 ```
 
 ### Performance Optimization Example
@@ -610,6 +634,7 @@ working_directory: "/Users/username/my-django-project"
 execution_mode: "on-failure"
 sandbox_mode: "read-only"
 output_format: "explanation"
+task_complexity: "medium"
 ```
 
 **Implementation Phase:**
@@ -619,6 +644,7 @@ working_directory: "/Users/username/my-django-project"
 execution_mode: "on-failure"
 sandbox_mode: "workspace-write"
 output_format: "diff"
+task_complexity: "high"
 ```
 
 ## Error Handling
