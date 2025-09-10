@@ -49,6 +49,12 @@ cache_ttl = int(os.environ.get("CACHE_TTL", "3600"))  # Default 1 hour
 cache_max_size = int(os.environ.get("MAX_CACHE_SIZE", "100"))  # Default 100 entries
 result_cache = ResultCache(ttl=cache_ttl, max_size=cache_max_size)
 
+# Backward-compatible single-line delimiter; can be overridden via env var
+# Default mirrors historical behavior used by older tests/clients
+FINAL_OUTPUT_DELIMITER: str = os.environ.get(
+    "FINAL_OUTPUT_DELIMITER", "=x=x=x=x=x=x=x="
+)
+
 # Write operations will be checked dynamically in codex_delegate function
 
 
@@ -159,26 +165,147 @@ async def invoke_codex_cli(
         )
 
 
-def parse_codex_output(stdout: str, output_format: str) -> dict:
+def _extract_wrapped_content(
+    text: str, start_delimiter: str, end_delimiter: str
+) -> Optional[str]:
+    """
+    Extract content between start and end delimiters using greedy matching.
+    Uses the first start delimiter and the last end delimiter to maximize content range.
+
+    Args:
+        text: Input text to search
+        start_delimiter: Starting delimiter to find
+        end_delimiter: Ending delimiter to find
+
+    Returns:
+        Content between delimiters, or None if not found properly
+    """
+    # Find the first occurrence of the start delimiter
+    start_idx = text.find(start_delimiter)
+    if start_idx == -1:
+        return None
+
+    # Find the last occurrence of the end delimiter after the start delimiter
+    search_start = start_idx + len(start_delimiter)
+    end_idx = text.rfind(end_delimiter)
+    if end_idx == -1 or end_idx < search_start:
+        return None
+
+    # Extract content between delimiters
+    content = text[search_start:end_idx]
+    return content
+
+
+def _extract_after_delimiter(text: str, delimiter: str) -> str:
+    """
+    Return the substring after the first occurrence of the delimiter.
+
+    If the delimiter is not found, returns the original text unchanged.
+    Leading newlines/spaces after the delimiter are stripped.
+    """
+    idx = text.find(delimiter)
+    if idx == -1:
+        return text
+    # Move past delimiter
+    after = text[idx + len(delimiter) :]
+    # Strip all leading whitespace characters
+    return after.lstrip()
+
+
+def parse_codex_output(
+    stdout: str,
+    output_format: str,
+    delimiter: Optional[str] = None,
+    start_delimiter: Optional[str] = None,
+    end_delimiter: Optional[str] = None,
+    strict: Optional[bool] = None,
+) -> dict:
     """
     Parse Codex CLI output into structured JSON.
 
     Args:
         stdout: Codex CLI standard output
         output_format: Expected output format
+        delimiter: Single delimiter for backward compatibility (optional)
+        start_delimiter: Start delimiter for wrapper extraction (optional)
+        end_delimiter: End delimiter for wrapper extraction (optional)
+        strict: Enable strict delimiter enforcement (optional)
 
     Returns:
         Structured parsing result
     """
+    # Default delimiters and strict mode
+    default_start_delimiter = "--[=["
+    default_end_delimiter = "]=]--"
+    default_strict = False
+    # Backward-compatible single-line delimiter available as module-level constant
+
+    # Handle delimiter extraction
+    processed = stdout
+    has_delimiter = False
+
+    if start_delimiter is not None and end_delimiter is not None:
+        # Wrapper-style delimiter extraction
+        extracted_content = _extract_wrapped_content(
+            stdout, start_delimiter, end_delimiter
+        )
+        if extracted_content is not None:
+            processed = extracted_content
+            has_delimiter = True
+    elif delimiter is not None:
+        # Single delimiter extraction for backward compatibility
+        if delimiter in stdout:
+            processed = _extract_after_delimiter(stdout, delimiter)
+            has_delimiter = True
+    else:
+        # Use default wrapper delimiters
+        extracted_content = _extract_wrapped_content(
+            stdout, default_start_delimiter, default_end_delimiter
+        )
+        if extracted_content is not None:
+            processed = extracted_content
+            has_delimiter = True
+        else:
+            # Fallback to legacy single delimiter if present
+            if FINAL_OUTPUT_DELIMITER in stdout:
+                processed = _extract_after_delimiter(stdout, FINAL_OUTPUT_DELIMITER)
+                has_delimiter = True
+
+    # Check strict mode
+    resolved_strict = strict if strict is not None else default_strict
+    if resolved_strict and not has_delimiter:
+        expected_delimiters = ""
+        if start_delimiter and end_delimiter:
+            expected_delimiters = f"'{start_delimiter}' and '{end_delimiter}'"
+        elif delimiter:
+            expected_delimiters = f"'{delimiter}'"
+        else:
+            expected_delimiters = (
+                f"'{default_start_delimiter}' and '{default_end_delimiter}', "
+                f"or the legacy '{FINAL_OUTPUT_DELIMITER}'"
+            )
+
+        return {
+            "status": "error",
+            "error_type": "final_output_delimiter_missing",
+            "message": (
+                f"Final output delimiters not found in model output; "
+                f"expected {expected_delimiters}."
+            ),
+            "expected_delimiters": expected_delimiters,
+            "format": output_format,
+            "content": stdout.strip(),
+        }
+
     # Auto-detect output type
     output_type = "explanation"  # Default type
 
-    if "--- a/" in stdout and "+++ b/" in stdout:
+    if "--- a/" in processed and "+++ b/" in processed:
         output_type = "diff"
-    elif "```" in stdout and stdout.count("```") >= 2:
+    elif "```" in processed and processed.count("```") >= 2:
         output_type = "code"
     elif any(
-        keyword in stdout.lower()
+        keyword in processed.lower()
         for keyword in ["file:", "class ", "function ", "def ", "import "]
     ):
         output_type = "code"
@@ -186,7 +313,7 @@ def parse_codex_output(stdout: str, output_format: str) -> dict:
     return {
         "status": "success",
         "type": output_type,
-        "content": stdout.strip(),
+        "content": processed.strip(),
         "format": output_format,
         "detected_type": output_type,
     }
@@ -204,6 +331,9 @@ async def codex_delegate(
     ] = "workspace-write",
     output_format: Literal["diff", "full_file", "explanation"] = "diff",
     task_complexity: Literal["low", "medium", "high"] = "medium",
+    final_output_start_delimiter: Optional[str] = None,
+    final_output_end_delimiter: Optional[str] = None,
+    final_output_strict: Optional[bool] = None,
 ) -> str:
     """
     Leverage Codex's advanced analytical capabilities for code comprehension and
@@ -231,8 +361,15 @@ async def codex_delegate(
         working_directory: Project directory to analyze
         execution_mode: Approval strategy (default: on-failure)
         sandbox_mode: File access mode (forced to read-only unless --allow-write)
-        output_format: How to format the analysis results
+        output_format: How to format the analysis results; the bridge also
+            injects a format-specific instruction into the prompt so the model
+            returns only the requested format inside the delimiters
         task_complexity: Guidance for Codex's reasoning effort (default: "medium")
+        final_output_start_delimiter: Start delimiter for output extraction
+            (default: "--[=[")
+        final_output_end_delimiter: End delimiter for output extraction
+            (default: "]=]--")
+        final_output_strict: Enable strict delimiter enforcement (default: False)
 
     Returns:
         Detailed analysis, recommendations, or implementation plan
@@ -310,10 +447,50 @@ async def codex_delegate(
     codex_prompt = dde.prepare_codex_prompt(task_description)
     optimization_note = None  # Will be used for metacognitive optimization in future
 
+    # Resolve delimiter parameters
+    start_delimiter = (
+        final_output_start_delimiter
+        if final_output_start_delimiter is not None
+        else "--[=["
+    )
+    end_delimiter = (
+        final_output_end_delimiter
+        if final_output_end_delimiter is not None
+        else "]=]--"
+    )
+
+    # Build format-specific instruction and prepend delimiter instruction to prompt
+    if output_format == "diff":
+        format_instruction = (
+            "Inside the wrapper, output a unified diff only in git patch format "
+            "starting with '--- a/' and '+++ b/' headers. Do not include code "
+            "fences, comments, or extra text."
+        )
+    elif output_format == "full_file":
+        format_instruction = (
+            "Inside the wrapper, output only the complete final file content(s) "
+            "without any code fences or commentary. If multiple files, separate "
+            "each with a line 'File: <path>' followed by the file content."
+        )
+    else:  # explanation
+        format_instruction = (
+            "Inside the wrapper, output only the explanation as plain text, "
+            "with no code fences or extraneous headers."
+        )
+
+    delimiter_instruction = (
+        f"Please wrap your final deliverable content between "
+        f"{start_delimiter} and {end_delimiter} delimiters. "
+        f"Place any reasoning, explanation, or process details before the "
+        f"{start_delimiter} delimiter, "
+        f"and put only the final code, analysis, or requested output "
+        f"between the delimiters."
+    )
+
     try:
         # 5. Invoke Codex CLI
         stdout, stderr = await invoke_codex_cli(
-            codex_prompt,
+            f"{format_instruction}\n\n{delimiter_instruction}\n\n{codex_prompt}",
             working_directory,
             execution_mode,
             effective_sandbox_mode,
@@ -322,7 +499,13 @@ async def codex_delegate(
         )
 
         # 6. Parse output
-        result = parse_codex_output(stdout, output_format)
+        result = parse_codex_output(
+            stdout,
+            output_format,
+            start_delimiter=start_delimiter,
+            end_delimiter=end_delimiter,
+            strict=final_output_strict,
+        )
 
         # Add metadata
         result.update(
